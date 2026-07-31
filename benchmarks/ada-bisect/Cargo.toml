@@ -1,0 +1,23 @@
+# Standalone. Pins the last ada release BEFORE the whole-URL fast path
+# (ada PR #1175) so its contribution can be measured in isolation.
+[workspace]
+
+[package]
+name = "url-ada-bisect"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ada-url = "=3.4.6"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "shortparse"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
