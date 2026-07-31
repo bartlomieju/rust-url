@@ -273,19 +273,17 @@ fn is_verbatim_path_byte(b: u8) -> bool {
 /// Whether `host` is a domain the general parser would pass through unchanged:
 /// already lowercase, plainly not an IP address, and needing no IDNA work.
 fn is_verbatim_host(host: &[u8]) -> bool {
-    // Must start with a lowercase letter. This also rules out IPv4 and IPv6
-    // literals, which always start with a digit or '['.
     if !matches!(host.first(), Some(b'a'..=b'z')) {
         return false;
     }
     for label in host.split(|&b| b == b'.') {
-        // Reject empty labels, including a trailing dot, rather than reason
-        // about how the general parser treats them.
+        // Rejected rather than reasoning about how the general parser treats an
+        // empty label, which includes the trailing-dot form.
         if label.is_empty() {
             return false;
         }
-        // Punycode labels need real IDNA validation (`xn--` can decode to
-        // something invalid), so they are never verbatim.
+        // `xn--` can decode to something invalid, so punycode always needs real
+        // IDNA validation.
         if label.starts_with(b"xn--") {
             return false;
         }
@@ -308,13 +306,11 @@ fn is_verbatim_host(host: &[u8]) -> bool {
 ///
 /// Returns `None` whenever anything at all is unusual, so the caller falls back
 /// to the full parser. Every input this accepts must produce a `Url` identical
-/// to what the general parser would produce — that is enforced by a
-/// differential test over the WPT corpus, not by this comment.
+/// to what the general parser would produce; that is enforced by the
+/// differential tests below, not by this comment.
 fn parse_simple_absolute(input: &str) -> Option<Url> {
     let bytes = input.as_bytes();
 
-    // Scheme, matched literally. Anything else (uppercase, other schemes)
-    // falls back.
     let (scheme_end, host_start) = if bytes.starts_with(b"https://") {
         (5u32, 8usize)
     } else if bytes.starts_with(b"http://") {
@@ -324,16 +320,15 @@ fn parse_simple_absolute(input: &str) -> Option<Url> {
     };
 
     let rest = &bytes[host_start..];
-    // Reject on the first host byte before scanning anything. A host that does
-    // not begin with a lowercase letter can never be verbatim, and this one
-    // compare covers the common declines -- non-ASCII and punycode hosts, IPv4
-    // (leading digit), IPv6 ('['), uppercase -- so they do not pay for the scan
-    // below only to be rejected afterwards.
+    // Checked before the scan below so that the common declines -- non-ASCII
+    // and punycode hosts, IPv4's leading digit, IPv6, uppercase -- cost one
+    // compare instead of a walk to the path separator.
     if !matches!(rest.first(), Some(b'a'..=b'z')) {
         return None;
     }
-    // The host runs to the first '/'; anything else ends the fast path,
-    // including userinfo ('@'), a port (':'), query ('?') and fragment ('#').
+    // Everything that could follow the host instead of '/' -- userinfo '@', a
+    // port ':', a query '?', a fragment '#' -- is rejected below by the host
+    // and path byte classes, so scanning for '/' alone is enough here.
     let host_len = rest.iter().position(|&b| b == b'/').unwrap_or(rest.len());
     let (host, path) = rest.split_at(host_len);
     if !is_verbatim_host(host) {
@@ -438,13 +433,9 @@ impl<'a> ParseOptions<'a> {
 
     /// Parse an URL string with the configuration so far.
     pub fn parse(self, input: &str) -> Result<Url, crate::ParseError> {
-        // A relative reference is resolved against the base, so the result is
-        // roughly the base plus the reference; sizing the buffer for `input`
-        // alone makes every `Url::join` grow it a realloc at a time. Absolute
-        // inputs ignore the base, so they keep their exact `input.len()`.
-        // Fast path for simple absolute http(s) URLs. Only attempted when no
-        // base, encoding override or violation callback could affect the
-        // result, so the fast path never has to reason about them.
+        // Attempted only when nothing configured here could affect the result,
+        // so the fast path never has to reason about a base, an encoding
+        // override or violation reporting.
         if self.base_url.is_none()
             && self.encoding_override.is_none()
             && self.violation_fn.is_none()
@@ -454,6 +445,10 @@ impl<'a> ParseOptions<'a> {
             }
         }
 
+        // A relative reference is resolved against the base, so the result is
+        // roughly the base plus the reference; sizing for `input` alone makes
+        // every `Url::join` grow the buffer a realloc at a time. Absolute
+        // inputs ignore the base, so they keep their exact `input.len()`.
         let capacity = match self.base_url {
             Some(base) if !starts_with_scheme(input) => input.len() + base.serialization.len(),
             _ => input.len(),
@@ -3480,7 +3475,19 @@ mod fast_path_tests {
             "https://[::1]/",               // IPv6
             "https://example.123/",         // host ends in a number
             "https://xn--mgbh0fb.example/", // punycode
-            "https://مثال.example/",        // non-ASCII
+            // Punycode that fails IDNA validation. The general parser rejects
+            // these, so a fast path that passed `xn--` through verbatim would
+            // wrongly accept them.
+            "https://xn--a.example/",
+            "https://xn--.example/",
+            "https://xn--0.example/",
+            "https://xn--zzz.example/", // valid punycode, round-trips unchanged
+            "https://مثال.example/",    // non-ASCII
+            // Uppercase after a lowercase first byte, which the first-byte
+            // check alone does not catch.
+            "https://example.COM/",
+            "https://exAmple.com/",
+            "https://example.com/A/B", // uppercase is legal in a path
             "https://example..com/",        // empty label
             "https://example.com./",        // trailing dot
             "https://.example.com/",        // leading dot
@@ -3493,6 +3500,55 @@ mod fast_path_tests {
             "https://",                     // empty host
             "https:///a",                   // empty host with path
             "",
+            // Boundaries: the shortest accepted forms, and inputs shorter than
+            // the scheme literal, which must not index past the end.
+            "http://a",
+            "http://a/",
+            "https://a",
+            "http:/",
+            "http:",
+            "h",
+            "https:/",
+            "https://a/b",
+            // Hyphens and digits are legal inside a host, but not as its first
+            // byte nor as the first byte of its final label.
+            "https://a-b.c-d.example/",
+            "https://-example.com/",
+            "https://example-.com/",
+            "https://a1.b2.example/",
+            "https://example.c0m/",
+            "https://1example.com/", // digit-led host
+            "https://example.4/",    // final label is a number
+            // Every byte the path class admits, in one path.
+            "https://example.com/aZ0-_.~/@+,=$&;:!*'()",
+            // Bytes just outside that class, each of which the general parser
+            // percent-encodes.
+            "https://example.com/a[b",
+            "https://example.com/a]b",
+            "https://example.com/a|b",
+            "https://example.com/a\"b",
+            "https://example.com/a^b",
+            "https://example.com/a`b",
+            "https://example.com/a{b",
+            "https://example.com/a}b",
+            "https://example.com/a<b",
+            "https://example.com/a>b",
+            "https://example.com/a\rb",
+            // Dot segments in every position, and dots that do not form one.
+            "https://example.com/a/./b",
+            "https://example.com/a/../b",
+            "https://example.com/a/..",
+            "https://example.com/.",
+            "https://example.com/a.b/c",
+            "https://example.com/..a",
+            // Repeated and trailing separators.
+            "https://example.com//a",
+            "https://example.com/a//",
+            "https://example.com/a/",
+            // Non-ASCII in the path rather than the host.
+            "https://example.com/café",
+            // Long host and long path, to exercise both scans.
+            "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaa.example.com/aaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbb",
         ];
         for case in CASES {
             assert_agrees(case);
