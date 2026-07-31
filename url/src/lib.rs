@@ -324,6 +324,14 @@ fn parse_simple_absolute(input: &str) -> Option<Url> {
     };
 
     let rest = &bytes[host_start..];
+    // Reject on the first host byte before scanning anything. A host that does
+    // not begin with a lowercase letter can never be verbatim, and this one
+    // compare covers the common declines -- non-ASCII and punycode hosts, IPv4
+    // (leading digit), IPv6 ('['), uppercase -- so they do not pay for the scan
+    // below only to be rejected afterwards.
+    if !matches!(rest.first(), Some(b'a'..=b'z')) {
+        return None;
+    }
     // The host runs to the first '/'; anything else ends the fast path,
     // including userinfo ('@'), a port (':'), query ('?') and fragment ('#').
     let host_len = rest.iter().position(|&b| b == b'/').unwrap_or(rest.len());
