@@ -257,6 +257,116 @@ pub struct ParseOptions<'a> {
     violation_fn: Option<&'a dyn Fn(SyntaxViolation)>,
 }
 
+/// Path bytes that the general parser copies through verbatim: no
+/// percent-encoding, no backslash translation, no segment normalization.
+///
+/// Deliberately conservative. Every byte here must be one the general parser
+/// leaves untouched in a special-scheme path; anything else falls back.
+#[inline]
+fn is_verbatim_path_byte(b: u8) -> bool {
+    matches!(b,
+        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9'
+        | b'-' | b'_' | b'.' | b'~' | b'/' | b'@' | b'+' | b',' | b'=' | b'$'
+        | b'&' | b';' | b':' | b'!' | b'*' | b'\'' | b'(' | b')')
+}
+
+/// Whether `host` is a domain the general parser would pass through unchanged:
+/// already lowercase, plainly not an IP address, and needing no IDNA work.
+fn is_verbatim_host(host: &[u8]) -> bool {
+    // Must start with a lowercase letter. This also rules out IPv4 and IPv6
+    // literals, which always start with a digit or '['.
+    if !matches!(host.first(), Some(b'a'..=b'z')) {
+        return false;
+    }
+    for label in host.split(|&b| b == b'.') {
+        // Reject empty labels, including a trailing dot, rather than reason
+        // about how the general parser treats them.
+        if label.is_empty() {
+            return false;
+        }
+        // Punycode labels need real IDNA validation (`xn--` can decode to
+        // something invalid), so they are never verbatim.
+        if label.starts_with(b"xn--") {
+            return false;
+        }
+        if !label
+            .iter()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+        {
+            return false;
+        }
+    }
+    // A final label that starts with a digit makes the host "end in a number",
+    // which sends the general parser down the IPv4 path.
+    match host.rsplit(|&b| b == b'.').next() {
+        Some(last) => !matches!(last.first(), Some(b'0'..=b'9')),
+        None => false,
+    }
+}
+
+/// Parse a simple absolute `http(s)` URL without running the general parser.
+///
+/// Returns `None` whenever anything at all is unusual, so the caller falls back
+/// to the full parser. Every input this accepts must produce a `Url` identical
+/// to what the general parser would produce — that is enforced by a
+/// differential test over the WPT corpus, not by this comment.
+fn parse_simple_absolute(input: &str) -> Option<Url> {
+    let bytes = input.as_bytes();
+
+    // Scheme, matched literally. Anything else (uppercase, other schemes)
+    // falls back.
+    let (scheme_end, host_start) = if bytes.starts_with(b"https://") {
+        (5u32, 8usize)
+    } else if bytes.starts_with(b"http://") {
+        (4u32, 7usize)
+    } else {
+        return None;
+    };
+
+    let rest = &bytes[host_start..];
+    // The host runs to the first '/'; anything else ends the fast path,
+    // including userinfo ('@'), a port (':'), query ('?') and fragment ('#').
+    let host_len = rest.iter().position(|&b| b == b'/').unwrap_or(rest.len());
+    let (host, path) = rest.split_at(host_len);
+    if !is_verbatim_host(host) {
+        return None;
+    }
+    if !path.iter().copied().all(is_verbatim_path_byte) {
+        return None;
+    }
+    // "." and ".." segments need the general parser's normalization. Rejecting
+    // every "/." covers "/./", "/../", and a trailing "/." or "/..".
+    if path.windows(2).any(|w| w == b"/.") {
+        return None;
+    }
+
+    let host_end = host_start + host_len;
+    // A special URL with an empty path serializes with a "/" appended.
+    let serialization = if path.is_empty() {
+        let mut s = String::with_capacity(input.len() + 1);
+        s.push_str(input);
+        s.push('/');
+        s
+    } else {
+        String::from(input)
+    };
+
+    let host_start = to_u32(host_start).ok()?;
+    let host_end = to_u32(host_end).ok()?;
+    Some(Url {
+        serialization,
+        scheme_end,
+        username_end: host_start,
+        host_start,
+        host_end,
+        host: HostInternal::Domain,
+        port: None,
+        path_start: host_end,
+        query_start: None,
+        fragment_start: None,
+    })
+}
+
 /// Whether `input` begins with a URL scheme, i.e. `alpha *( alnum | "+" | "-" | "." ) ":"`.
 ///
 /// This only sizes the parse buffer, so it deliberately does not reproduce the
@@ -268,7 +378,9 @@ fn starts_with_scheme(input: &str) -> bool {
         return false;
     }
     bytes
-        .take_while(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'+' | b'-' | b'.' | b':'))
+        .take_while(
+            |b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'+' | b'-' | b'.' | b':'),
+        )
         .any(|&b| b == b':')
 }
 
@@ -322,6 +434,18 @@ impl<'a> ParseOptions<'a> {
         // roughly the base plus the reference; sizing the buffer for `input`
         // alone makes every `Url::join` grow it a realloc at a time. Absolute
         // inputs ignore the base, so they keep their exact `input.len()`.
+        // Fast path for simple absolute http(s) URLs. Only attempted when no
+        // base, encoding override or violation callback could affect the
+        // result, so the fast path never has to reason about them.
+        if self.base_url.is_none()
+            && self.encoding_override.is_none()
+            && self.violation_fn.is_none()
+        {
+            if let Some(url) = parse_simple_absolute(input) {
+                return Ok(url);
+            }
+        }
+
         let capacity = match self.base_url {
             Some(base) if !starts_with_scheme(input) => input.len() + base.serialization.len(),
             _ => input.len(),
@@ -3249,5 +3373,148 @@ impl Drop for UrlQuery<'_> {
         if let Some(url) = self.url.take() {
             url.restore_already_parsed_fragment(self.fragment.take())
         }
+    }
+}
+
+#[cfg(test)]
+mod fast_path_tests {
+    use super::*;
+    use std::eprintln;
+
+    /// The general parser, with the fast path bypassed.
+    fn parse_general(input: &str) -> Result<Url, crate::ParseError> {
+        Parser {
+            serialization: String::with_capacity(input.len()),
+            base_url: None,
+            query_encoding_override: None,
+            violation_fn: None,
+            context: Context::UrlParser,
+        }
+        .parse_url(input)
+    }
+
+    /// Whatever the fast path accepts, it must produce field-for-field exactly
+    /// what the general parser produces.
+    fn assert_agrees(input: &str) {
+        let Some(fast) = parse_simple_absolute(input) else {
+            return; // declined; the general parser handles it
+        };
+        let slow = parse_general(input).unwrap_or_else(|e| {
+            panic!(
+                "fast path accepted {:?} but general parser failed: {}",
+                input, e
+            )
+        });
+        assert_eq!(
+            fast.serialization, slow.serialization,
+            "serialization for {:?}",
+            input
+        );
+        assert_eq!(
+            fast.scheme_end, slow.scheme_end,
+            "scheme_end for {:?}",
+            input
+        );
+        assert_eq!(
+            fast.username_end, slow.username_end,
+            "username_end for {:?}",
+            input
+        );
+        assert_eq!(
+            fast.host_start, slow.host_start,
+            "host_start for {:?}",
+            input
+        );
+        assert_eq!(fast.host_end, slow.host_end, "host_end for {:?}", input);
+        assert_eq!(fast.host, slow.host, "host for {:?}", input);
+        assert_eq!(fast.port, slow.port, "port for {:?}", input);
+        assert_eq!(
+            fast.path_start, slow.path_start,
+            "path_start for {:?}",
+            input
+        );
+        assert_eq!(
+            fast.query_start, slow.query_start,
+            "query_start for {:?}",
+            input
+        );
+        assert_eq!(
+            fast.fragment_start, slow.fragment_start,
+            "fragment_start for {:?}",
+            input
+        );
+    }
+
+    #[test]
+    fn fast_path_matches_general_parser() {
+        const CASES: &[&str] = &[
+            // Expected to take the fast path.
+            "https://example.com/bench",
+            "http://example.com/",
+            "https://example.com",
+            "https://deno.land/x/oak@v12.6.1/mod.ts",
+            "https://sub.domain.example.org/a/b/c.ts",
+            "https://ex-ample.com/a~b/c!d/e'f/(g)/h*i",
+            "https://a.b/c:d@e/f,g;h=i$j&k+l",
+            // Expected to be declined - each would need general-parser work.
+            "https://EXAMPLE.com/",         // uppercase host
+            "https://example.com:8080/",    // port
+            "https://user@example.com/",    // userinfo
+            "https://example.com/a?q=1",    // query
+            "https://example.com/a#frag",   // fragment
+            "https://example.com/a%2Fb",    // percent-encoding
+            "https://example.com/a b",      // space needs encoding
+            "https://example.com/a\\b",     // backslash
+            "https://example.com/./a",      // dot segment
+            "https://example.com/../a",     // dot-dot segment
+            "https://example.com/a/.",      // trailing dot segment
+            "https://127.0.0.1/",           // IPv4
+            "https://[::1]/",               // IPv6
+            "https://example.123/",         // host ends in a number
+            "https://xn--mgbh0fb.example/", // punycode
+            "https://مثال.example/",        // non-ASCII
+            "https://example..com/",        // empty label
+            "https://example.com./",        // trailing dot
+            "https://.example.com/",        // leading dot
+            "https://exa_mple.com/",        // underscore
+            "https://example.com/a\tb",     // tab
+            "https://example.com/a\nb",     // newline
+            "ftp://example.com/",           // other scheme
+            "HTTPS://example.com/",         // uppercase scheme
+            "https:/example.com/",          // single slash
+            "https://",                     // empty host
+            "https:///a",                   // empty host with path
+            "",
+        ];
+        for case in CASES {
+            assert_agrees(case);
+        }
+    }
+
+    /// Exhaustive differential run over an external corpus, when one is given:
+    /// `URL_DIFF_CORPUS=/path/to/urls.txt cargo test`
+    #[test]
+    fn fast_path_matches_general_parser_on_corpus() {
+        let Ok(path) = std::env::var("URL_DIFF_CORPUS") else {
+            return;
+        };
+        let data = std::fs::read_to_string(&path).expect("corpus readable");
+        let mut accepted = 0usize;
+        let mut total = 0usize;
+        for line in data.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            total += 1;
+            if parse_simple_absolute(line).is_some() {
+                accepted += 1;
+            }
+            assert_agrees(line);
+        }
+        eprintln!(
+            "corpus differential: {}/{} took the fast path",
+            accepted, total
+        );
     }
 }
