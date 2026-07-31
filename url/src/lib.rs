@@ -257,6 +257,21 @@ pub struct ParseOptions<'a> {
     violation_fn: Option<&'a dyn Fn(SyntaxViolation)>,
 }
 
+/// Whether `input` begins with a URL scheme, i.e. `alpha *( alnum | "+" | "-" | "." ) ":"`.
+///
+/// This only sizes the parse buffer, so it deliberately does not reproduce the
+/// parser's full scheme handling: a wrong answer costs a little capacity, never
+/// correctness.
+fn starts_with_scheme(input: &str) -> bool {
+    let mut bytes = input.as_bytes().iter();
+    if !matches!(bytes.next(), Some(c) if c.is_ascii_alphabetic()) {
+        return false;
+    }
+    bytes
+        .take_while(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'+' | b'-' | b'.' | b':'))
+        .any(|&b| b == b':')
+}
+
 impl<'a> ParseOptions<'a> {
     /// Change the base URL
     ///
@@ -303,8 +318,16 @@ impl<'a> ParseOptions<'a> {
 
     /// Parse an URL string with the configuration so far.
     pub fn parse(self, input: &str) -> Result<Url, crate::ParseError> {
+        // A relative reference is resolved against the base, so the result is
+        // roughly the base plus the reference; sizing the buffer for `input`
+        // alone makes every `Url::join` grow it a realloc at a time. Absolute
+        // inputs ignore the base, so they keep their exact `input.len()`.
+        let capacity = match self.base_url {
+            Some(base) if !starts_with_scheme(input) => input.len() + base.serialization.len(),
+            _ => input.len(),
+        };
         Parser {
-            serialization: String::with_capacity(input.len()),
+            serialization: String::with_capacity(capacity),
             base_url: self.base_url,
             query_encoding_override: self.encoding_override,
             violation_fn: self.violation_fn,
