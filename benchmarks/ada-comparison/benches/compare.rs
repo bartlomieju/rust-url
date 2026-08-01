@@ -142,6 +142,31 @@ fn bench(c: &mut Criterion) {
     });
     g.finish();
 
+    // 4c. Joining an *absolute* specifier onto a base. The base is ignored, so
+    // this is really an absolute parse wearing a join's clothes.
+    let mut g = c.benchmark_group("join_absolute");
+    let abs_specs = [
+        "https://deno.land/std@0.200.0/http/server.ts",
+        "https://esm.sh/react@18.2.0",
+        "http://example.com/a/b/c.ts",
+    ];
+    g.bench_function("rust-url join (base preparsed)", |b| {
+        let base = mod_base.parse::<url::Url>().unwrap();
+        b.iter(|| {
+            for s in &abs_specs {
+                black_box(base.join(black_box(s)).unwrap());
+            }
+        })
+    });
+    g.bench_function("ada (base reparsed)", |b| {
+        b.iter(|| {
+            for s in &abs_specs {
+                black_box(ada_url::Url::parse(black_box(*s), Some(mod_base)).unwrap());
+            }
+        })
+    });
+    g.finish();
+
     // 5. IDN / unicode host, where rust-url pays for full IDNA tables.
     let mut g = c.benchmark_group("parse_idn");
     let idn = "https://الاسم.مثال/path";

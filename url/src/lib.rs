@@ -476,13 +476,16 @@ impl<'a> ParseOptions<'a> {
 
     /// Parse an URL string with the configuration so far.
     pub fn parse(self, input: &str) -> Result<Url, crate::ParseError> {
-        // Attempted only when nothing configured here could affect the result,
-        // so the fast path never has to reason about a base, an encoding
-        // override or violation reporting.
-        if self.base_url.is_none()
-            && self.encoding_override.is_none()
-            && self.violation_fn.is_none()
-        {
+        // A base is not excluded here: the fast path only accepts inputs with
+        // exactly two slashes after the scheme, and the general parser consults
+        // the base only when fewer than two follow it (the "special relative"
+        // state in `parse_with_scheme`). So the base is provably ignored for
+        // everything the fast path accepts, which lets `Url::join` take it for
+        // absolute inputs.
+        //
+        // An encoding override does still change how a query is serialized, and
+        // a violation callback expects to be called, so both are excluded.
+        if self.encoding_override.is_none() && self.violation_fn.is_none() {
             if let Some(url) = parse_simple_absolute(input) {
                 return Ok(url);
             }
