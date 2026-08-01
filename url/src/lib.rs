@@ -270,6 +270,17 @@ fn is_verbatim_path_byte(b: u8) -> bool {
         | b'&' | b';' | b':' | b'!' | b'*' | b'\'' | b'(' | b')')
 }
 
+/// Query bytes the general parser copies through verbatim, i.e. the complement
+/// of the special-query percent-encode set (controls, space, `"`, `#`, `<`,
+/// `>`, `'`, and everything non-ASCII).
+///
+/// `%` is deliberately included: the parser does not re-encode existing escapes
+/// in a query, so `%2F` survives unchanged.
+#[inline]
+fn is_verbatim_query_byte(b: u8) -> bool {
+    b.is_ascii() && b > b' ' && b != 0x7F && !matches!(b, b'"' | b'#' | b'<' | b'>' | b'\'')
+}
+
 /// Whether `host` is a domain the general parser would pass through unchanged:
 /// already lowercase, plainly not an IP address, and needing no IDNA work.
 fn is_verbatim_host(host: &[u8]) -> bool {
@@ -330,12 +341,38 @@ fn parse_simple_absolute(input: &str) -> Option<Url> {
     // port ':', a query '?', a fragment '#' -- is rejected below by the host
     // and path byte classes, so scanning for '/' alone is enough here.
     let host_len = rest.iter().position(|&b| b == b'/').unwrap_or(rest.len());
-    let (host, path) = rest.split_at(host_len);
+    let (host, after_host) = rest.split_at(host_len);
     if !is_verbatim_host(host) {
         return None;
     }
-    if !path.iter().copied().all(is_verbatim_path_byte) {
-        return None;
+    // Validating the path and locating the query is one pass, not two: a URL
+    // without a query is the common case and must not pay to be scanned twice.
+    //
+    // A query is only handled when a path precedes it. `https://host?q` gains a
+    // "/" in its serialization, so the input is no longer copied verbatim, and
+    // that shape is rare enough not to be worth a second output form.
+    let mut path_len = 0;
+    while path_len < after_host.len() {
+        let b = after_host[path_len];
+        if b == b'?' {
+            break;
+        }
+        if !is_verbatim_path_byte(b) {
+            return None;
+        }
+        path_len += 1;
+    }
+    let (path, query) = if path_len < after_host.len() {
+        (&after_host[..path_len], Some(&after_host[path_len + 1..]))
+    } else {
+        (after_host, None)
+    };
+    // '#' is outside both byte classes, so an input carrying a fragment is
+    // declined here rather than needing its own handling.
+    if let Some(query) = query {
+        if !query.iter().copied().all(is_verbatim_query_byte) {
+            return None;
+        }
     }
     // "." and ".." segments need the general parser's normalization. Rejecting
     // every "/." covers "/./", "/../", and a trailing "/." or "/..".
@@ -344,7 +381,8 @@ fn parse_simple_absolute(input: &str) -> Option<Url> {
     }
 
     let host_end = host_start + host_len;
-    // A special URL with an empty path serializes with a "/" appended.
+    // A special URL with an empty path serializes with a "/" appended. That can
+    // only happen without a query, since a query requires a preceding path.
     let serialization = if path.is_empty() {
         let mut s = String::with_capacity(input.len() + 1);
         s.push_str(input);
@@ -354,6 +392,11 @@ fn parse_simple_absolute(input: &str) -> Option<Url> {
         String::from(input)
     };
 
+    // `query_start` indexes the '?' itself, not the first byte after it.
+    let query_start = match query {
+        Some(_) => Some(to_u32(host_end + path.len()).ok()?),
+        None => None,
+    };
     let host_start = to_u32(host_start).ok()?;
     let host_end = to_u32(host_end).ok()?;
     Some(Url {
@@ -365,7 +408,7 @@ fn parse_simple_absolute(input: &str) -> Option<Url> {
         host: HostInternal::Domain,
         port: None,
         path_start: host_end,
-        query_start: None,
+        query_start,
         fragment_start: None,
     })
 }
@@ -3463,7 +3506,23 @@ mod fast_path_tests {
             "https://EXAMPLE.com/",         // uppercase host
             "https://example.com:8080/",    // port
             "https://user@example.com/",    // userinfo
-            "https://example.com/a?q=1",    // query
+            // Queries taking the fast path.
+            "https://example.com/a?q=1",
+            "https://example.com/?q=1",
+            "https://example.com/a?",
+            "https://example.com/a?q=1&r=2",
+            "https://example.com/a?q=%2F",
+            "https://example.com/a?q=a+b",
+            "https://example.com/a?a[]=1&b{}=2",
+            "https://example.com/a?q=/?:@!$&()*,;=",
+            // Queries the fast path declines.
+            "https://example.com/a?q=1#f",  // fragment after query
+            "https://example.com/a?q= b",   // space in query
+            "https://example.com/a?q=\"x\"", // quote in query
+            "https://example.com/a?q=<x>",  // angle brackets
+            "https://example.com/a?q='x'",  // apostrophe (special-query only)
+            "https://example.com/a?q=café", // non-ASCII
+            "https://example.com?q=1",      // query with no path
             "https://example.com/a#frag",   // fragment
             "https://example.com/a%2Fb",    // percent-encoding
             "https://example.com/a b",      // space needs encoding
