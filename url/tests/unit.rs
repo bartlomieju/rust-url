@@ -1547,3 +1547,81 @@ fn test_join_resolution_is_unaffected_by_buffer_sizing() {
         assert_eq!(joined, Url::parse(expected).unwrap(), "join({:?})", input);
     }
 }
+
+/// An absolute input ignores the base, so `join` must agree with `parse` for
+/// every input the fast path accepts, whatever the base looks like.
+#[test]
+fn test_join_absolute_matches_parse_for_every_base() {
+    const BASES: &[&str] = &[
+        "https://example.com/a/b/c?x=1#y",
+        "http://other.example/",
+        "https://user:pw@host.example:8080/p?q#f",
+        "file:///a/b/c",
+        "sc://%C3%B1/x",       // non-special scheme
+        "data:text/plain,foo", // cannot-be-a-base
+        "https://xn--mgbh0fb.example/",
+    ];
+    const INPUTS: &[&str] = &[
+        // Shapes the fast path accepts.
+        "https://target.example/p",
+        "http://target.example/p/q?r=1",
+        "https://target.example",
+        "https://target.example/",
+        // Shapes it declines, which must still resolve identically.
+        "https://TARGET.example/p",
+        "https://target.example:9000/p",
+        "https://target.example/p#f",
+        "https://127.0.0.1/p",
+        "https://target.example/a/../b",
+        // Extra slashes: the base is still ignored, but not by the fast path.
+        "https:///target.example/p",
+        "https:////target.example/p",
+    ];
+    for base in BASES {
+        let base = Url::parse(base).unwrap();
+        for input in INPUTS {
+            let joined = base.join(input);
+            let parsed = Url::parse(input);
+            assert_eq!(
+                joined.as_ref().map(|u| u.as_str()),
+                parsed.as_ref().map(|u| u.as_str()),
+                "join({:?}) on base {:?}",
+                input,
+                base.as_str()
+            );
+            assert_eq!(
+                joined,
+                parsed,
+                "join({:?}) on base {:?}",
+                input,
+                base.as_str()
+            );
+        }
+    }
+}
+
+/// Relative inputs must keep resolving against the base, i.e. the fast path
+/// must not swallow them now that a base no longer disables it.
+#[test]
+fn test_join_relative_still_resolves_against_base() {
+    let base = Url::parse("https://example.com/a/b/c?x=1#y").unwrap();
+    assert_eq!(
+        base.join("./d").unwrap().as_str(),
+        "https://example.com/a/b/d"
+    );
+    assert_eq!(base.join("/d").unwrap().as_str(), "https://example.com/d");
+    assert_eq!(
+        base.join("//other.example/d").unwrap().as_str(),
+        "https://other.example/d"
+    );
+    // Same scheme with fewer than two slashes is the "special relative" state,
+    // which resolves against the base rather than being an absolute URL.
+    assert_eq!(
+        base.join("https:/d").unwrap().as_str(),
+        "https://example.com/d"
+    );
+    assert_eq!(
+        base.join("https:d").unwrap().as_str(),
+        "https://example.com/a/b/d"
+    );
+}
