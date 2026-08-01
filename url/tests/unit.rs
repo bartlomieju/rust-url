@@ -1412,3 +1412,216 @@ fn test_path_percent_encode() {
     let url = Url::parse("http://localhost/a}b").unwrap();
     assert_eq!(url.path(), "/a%7Db");
 }
+
+/// Setting a syntax-violation callback makes `ParseOptions::parse` skip the
+/// fast path for simple absolute http(s) URLs, so parsing the same input with
+/// and without one exercises both routes and must agree on every observable.
+#[test]
+fn test_fast_path_agrees_with_general_parser() {
+    const CASES: &[&str] = &[
+        "https://example.com/bench",
+        "https://example.com",
+        "http://example.com/",
+        "https://deno.land/x/oak@v12.6.1/mod.ts",
+        "https://example.com/aZ0-_.~/@+,=$&;:!*'()",
+        "https://a-b.c-d.example/a/b/c",
+        "http://a",
+        "https://example.com//a//",
+        // Declined by the fast path; included so the test still covers them.
+        "https://EXAMPLE.com/",
+        "https://example.com:8080/a",
+        "https://user:pw@example.com/a",
+        "https://example.com/a?q=1&r=2",
+        "https://example.com/?q=1",
+        "https://example.com/a?",
+        "https://example.com/a?q=%2F&r=a+b",
+        "https://example.com/a?q=/?:@!$&()*,;=",
+        "https://example.com/a?q= b",
+        "https://example.com/a?q='x'",
+        "https://example.com/a?q=café",
+        "https://example.com?q=1",
+        "https://example.com/a?q=1#f",
+        "https://example.com/a#frag",
+        "https://example.com/a b",
+        "https://example.com/a%2Fb",
+        "https://example.com/a/../b",
+        "https://127.0.0.1/a",
+        "https://[::1]/a",
+        "https://xn--mgbh0fb.example/",
+        "https://xn--zzz.example/",
+        "https://مثال.example/",
+        "https://example.com/café",
+        // Uppercase after a lowercase first byte, which a first-byte check
+        // alone would not catch.
+        "https://example.COM/",
+        "https://exAmple.com/",
+        "https://example.com/A/B",
+    ];
+    for input in CASES {
+        let fast = Url::parse(input).unwrap();
+        let general = Url::options()
+            .syntax_violation_callback(Some(&|_| {}))
+            .parse(input)
+            .unwrap();
+        assert_eq!(fast, general, "Url mismatch for {:?}", input);
+        assert_eq!(fast.as_str(), general.as_str(), "as_str for {:?}", input);
+        assert_eq!(fast.scheme(), general.scheme(), "scheme for {:?}", input);
+        assert_eq!(fast.host_str(), general.host_str(), "host for {:?}", input);
+        assert_eq!(fast.port(), general.port(), "port for {:?}", input);
+        assert_eq!(fast.path(), general.path(), "path for {:?}", input);
+        assert_eq!(fast.query(), general.query(), "query for {:?}", input);
+        assert_eq!(
+            fast.fragment(),
+            general.fragment(),
+            "fragment for {:?}",
+            input
+        );
+        assert_eq!(
+            fast.username(),
+            general.username(),
+            "username for {:?}",
+            input
+        );
+        assert_eq!(
+            fast.password(),
+            general.password(),
+            "password for {:?}",
+            input
+        );
+        assert_eq!(
+            fast.path_segments().map(|s| s.collect::<Vec<_>>()),
+            general.path_segments().map(|s| s.collect::<Vec<_>>()),
+            "path_segments for {:?}",
+            input
+        );
+    }
+}
+
+/// A `Url` from the fast path must stay correct once mutated, which is what
+/// catches a wrong component offset that the getters alone would not reveal.
+#[test]
+fn test_fast_path_url_is_mutable() {
+    let mut url = Url::parse("https://example.com/a/b").unwrap();
+    url.set_query(Some("q=1"));
+    assert_eq!(url.as_str(), "https://example.com/a/b?q=1");
+    url.set_fragment(Some("frag"));
+    assert_eq!(url.as_str(), "https://example.com/a/b?q=1#frag");
+    url.set_path("/c");
+    assert_eq!(url.as_str(), "https://example.com/c?q=1#frag");
+    url.set_host(Some("other.example")).unwrap();
+    assert_eq!(url.as_str(), "https://other.example/c?q=1#frag");
+    url.set_port(Some(8080)).unwrap();
+    assert_eq!(url.as_str(), "https://other.example:8080/c?q=1#frag");
+    url.set_username("user").unwrap();
+    assert_eq!(url.as_str(), "https://user@other.example:8080/c?q=1#frag");
+
+    let mut empty_path = Url::parse("https://example.com").unwrap();
+    assert_eq!(empty_path.path(), "/");
+    empty_path.set_path("/x");
+    assert_eq!(empty_path.as_str(), "https://example.com/x");
+}
+
+/// `Url::join` sizes its buffer from the base plus the reference, which must
+/// not change what it resolves to.
+#[test]
+fn test_join_resolution_is_unaffected_by_buffer_sizing() {
+    let base = Url::parse("https://example.com/a/b/c?x=1#y").unwrap();
+    let cases: &[(&str, &str)] = &[
+        ("./d.ts", "https://example.com/a/b/d.ts"),
+        ("../d.ts", "https://example.com/a/d.ts"),
+        ("../../d.ts", "https://example.com/d.ts"),
+        ("../../../d.ts", "https://example.com/d.ts"),
+        ("/d.ts", "https://example.com/d.ts"),
+        ("d.ts", "https://example.com/a/b/d.ts"),
+        ("", "https://example.com/a/b/c?x=1"),
+        ("#z", "https://example.com/a/b/c?x=1#z"),
+        ("?q=2", "https://example.com/a/b/c?q=2"),
+        ("//other.example/d", "https://other.example/d"),
+        ("http://other.example/d", "http://other.example/d"),
+        ("https://other.example/d", "https://other.example/d"),
+    ];
+    for (input, expected) in cases {
+        let joined = base.join(input).unwrap();
+        assert_eq!(joined.as_str(), *expected, "join({:?})", input);
+        // Resolving against a base must match parsing the result outright.
+        assert_eq!(joined, Url::parse(expected).unwrap(), "join({:?})", input);
+    }
+}
+
+/// An absolute input ignores the base, so `join` must agree with `parse` for
+/// every input the fast path accepts, whatever the base looks like.
+#[test]
+fn test_join_absolute_matches_parse_for_every_base() {
+    const BASES: &[&str] = &[
+        "https://example.com/a/b/c?x=1#y",
+        "http://other.example/",
+        "https://user:pw@host.example:8080/p?q#f",
+        "file:///a/b/c",
+        "sc://%C3%B1/x",       // non-special scheme
+        "data:text/plain,foo", // cannot-be-a-base
+        "https://xn--mgbh0fb.example/",
+    ];
+    const INPUTS: &[&str] = &[
+        // Shapes the fast path accepts.
+        "https://target.example/p",
+        "http://target.example/p/q?r=1",
+        "https://target.example",
+        "https://target.example/",
+        // Shapes it declines, which must still resolve identically.
+        "https://TARGET.example/p",
+        "https://target.example:9000/p",
+        "https://target.example/p#f",
+        "https://127.0.0.1/p",
+        "https://target.example/a/../b",
+        // Extra slashes: the base is still ignored, but not by the fast path.
+        "https:///target.example/p",
+        "https:////target.example/p",
+    ];
+    for base in BASES {
+        let base = Url::parse(base).unwrap();
+        for input in INPUTS {
+            let joined = base.join(input);
+            let parsed = Url::parse(input);
+            assert_eq!(
+                joined.as_ref().map(|u| u.as_str()),
+                parsed.as_ref().map(|u| u.as_str()),
+                "join({:?}) on base {:?}",
+                input,
+                base.as_str()
+            );
+            assert_eq!(
+                joined,
+                parsed,
+                "join({:?}) on base {:?}",
+                input,
+                base.as_str()
+            );
+        }
+    }
+}
+
+/// Relative inputs must keep resolving against the base, i.e. the fast path
+/// must not swallow them now that a base no longer disables it.
+#[test]
+fn test_join_relative_still_resolves_against_base() {
+    let base = Url::parse("https://example.com/a/b/c?x=1#y").unwrap();
+    assert_eq!(
+        base.join("./d").unwrap().as_str(),
+        "https://example.com/a/b/d"
+    );
+    assert_eq!(base.join("/d").unwrap().as_str(), "https://example.com/d");
+    assert_eq!(
+        base.join("//other.example/d").unwrap().as_str(),
+        "https://other.example/d"
+    );
+    // Same scheme with fewer than two slashes is the "special relative" state,
+    // which resolves against the base rather than being an absolute URL.
+    assert_eq!(
+        base.join("https:/d").unwrap().as_str(),
+        "https://example.com/d"
+    );
+    assert_eq!(
+        base.join("https:d").unwrap().as_str(),
+        "https://example.com/a/b/d"
+    );
+}
